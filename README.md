@@ -25,7 +25,7 @@
 ## DEPENDENCIES
 
   There are no additional dependencies, but assumptions are made about the
-  executable location of `ssh-agent` and `ssh-add`.
+  executable location of `ssh-agent`, `ssh-add`, and `ssh-keygen`.
 
 ## INSTALL
 

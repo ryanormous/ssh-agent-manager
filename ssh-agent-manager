@@ -1,31 +1,27 @@
 #!/usr/bin/env python3
 '''\
-{NAME}
+ssh-agent-manager
 
 ACTIONS:
- help)
-   THIS IS IT.
-
  start)
    START «ssh-agent» INSTANCE.
    AN IDENTITY MAY BE GIVEN FOR «ssh-add».
 
  stop)
    STOP «ssh-agent» INSTANCE.
-   WILL TRY TO USE --spec OR --id PARAMETER, IF GIVEN.
+   IF GIVEN, --spec OR --id PARAMETER WILL BE USED.
 
  status)
    STATUS OF «ssh-agent» INSTANCES MANAGED BY «{NAME}».
    NOTE: OTHER, NON-MANAGED INSTANCES MAY ALSO EXIST.
-   WILL TRY TO USE --spec OR --id PARAMETER, IF GIVEN.
+   IF GIVEN, --spec OR --id PARAMETER WILL BE USED.
 
  env)
    PRINT «ssh-agent» VARIABLES SUITABLE FOR `eval`.
    RETURNS SOCKET AND PID FOR MANAGED INSTANCE, IF ANY.
-   USAGE:
-     $ eval $(ssh-agent-manager env)
-     … OR …
-     $ export $(ssh-agent-manager env --id some_id_rsa)
+
+ help)
+   THIS IS IT.
 
 OPTIONS:
  -s, --spec)
@@ -34,30 +30,49 @@ OPTIONS:
  -i, --id)
    FILENAME FOR SSH PRIVATE KEY IDENTITY.
 
-ENVIRONMENT VARIABLES:
+ENVIRONMENT VARIABLES RECOGNIZED BY «ssh-agent-manager»:
  SSH_DIR)
    OPTIONAL.
    DIRECTORY WHERE SSH PRIVATE KEY IDENTITIES ARE FOUND.
+    ~/.ssh IS DEFAULT.
 
  SSH_TMP)
-   OPTIONAL. DEFAULTS TO $XDG_RUNTIME_DIR, OR "/tmp"
+   OPTIONAL.
    DIRECTORY UNDER WHICH «ssh-agent» SOCKET AND PID FILE ARE WRITTEN.
+   DEFAULT IS $XDG_RUNTIME_DIR OR /tmp
+
+ENVIRONMENT VARIABLES USED BY «ssh-agent»:
+ SSH_AGENT_PID)
+ SSH_AUTH_SOCK)
+   THESE ARE USED TO DISCOVER AND MANAGE AGENT.
+
+EXAMPLE USAGE:
+ START AGENT USING IDENTITY
+   $ ssh-agent-manager start --id some_id_rsa
+
+ STOP AGENT USING SPECIFIER
+   $ ssh-agent-manager stop --spec 111.2222.333
+
+ POPULATE ENVIRONMENT WITH «ssh-agent» VARIABLES:
+   $ eval $(ssh-agent-manager env)
+   … OR …
+   $ export $(ssh-agent-manager env --id some_id_rsa)
 '''
 
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
 # IMPORT
 
-import argparse
 import os
 import re
 import sys
 import time
+from argparse import ArgumentParser, Namespace
 from pwd import getpwuid
 from signal import SIGHUP
 from stat import S_ISSOCK as is_socket
 from subprocess import Popen
-from typing import Any, List
+from typing import TypedDict
 
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
@@ -76,21 +91,20 @@ TIMEOUT=3000
 # EXCEPTION
 
 class Help(SystemExit):
-    fname = os.path.basename(__file__)
     def __init__(self) -> None:
-        print(__doc__.format(NAME=self.fname))
+        print(__doc__)
         super().__init__()
 
 
 class AgentAlreadyExists(SystemExit):
     msg = 'SSH_AGENT_PID=%s SSH_AUTH_SOCK=%s'
-    def __init__(self, pid: str, sock: str) -> None:
+    def __init__(self, pid:str, sock:str) -> None:
         print(self.msg % (pid, sock), end='')
         super().__init__('\0')
 
 
 class NoAgentFound(SystemExit):
-    def __init__(self, detail: str = str()) -> None:
+    def __init__(self, detail: str=str()) -> None:
         msg = 'NO AGENT WAS FOUND'
         if detail:
             msg = ' '.join((msg, detail))
@@ -100,7 +114,7 @@ class NoAgentFound(SystemExit):
 
 
 class StartAgentError(RuntimeError):
-    def __init__(self, err: str = str()) -> None:
+    def __init__(self, err: str=str()) -> None:
         msg = 'PROBLEM STARTING AGENT.'
         if err:
             msg = '\n'.join((msg, err))
@@ -108,7 +122,7 @@ class StartAgentError(RuntimeError):
 
 
 class AddIdentityError(RuntimeError):
-    def __init__(self, err: str = str()) -> None:
+    def __init__(self, err: str=str()) -> None:
         msg = 'PROBLEM ADDING SSH IDENTITY.'
         if err:
             msg = '\n'.join((msg, err))
@@ -124,16 +138,8 @@ class IdentityNotFoundError(Exception):
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
 # ARGUMENT
 
-# ENVIRONMENT VARIABLES USED BY «ssh-agent»
-#  · SSH_AGENT_PID
-#  · SSH_AUTH_SOCK
-
-# ENVIRONMENT VARIABLES USED BY «ssh-agent-manager»
-#  · SSH_DIR
-#  · SSH_TMP
-
 class Arg:
-    namespace = argparse.Namespace(
+    namespace = Namespace(
         action = str(),
         identity = str(),
         specifier = str(),
@@ -141,7 +147,7 @@ class Arg:
         ssh_tmp = str()
     )
 
-    def __call__(self) -> argparse.Namespace:
+    def __call__(self) -> Namespace:
         return self.namespace
 
     def __init__(self) -> None:
@@ -149,9 +155,9 @@ class Arg:
         self.get_env_args()
 
     def get_cmd_args(self) -> None:
-        parser = argparse.ArgumentParser(
+        parser = ArgumentParser(
             add_help = False,
-            usage = argparse.SUPPRESS
+            usage = '==SUPPRESS=='
         )
         parser.add_argument(
             '-h', '--help',
@@ -220,7 +226,7 @@ class StartAgent:
     get_specifier = re.compile('\d{7}\.\d{3}')
     get_agent_pid = re.compile('(?<=^SSH_AGENT_PID=)\d+')
 
-    def __init__(self, arg: argparse.Namespace) -> None:
+    def __init__(self, arg:Namespace) -> None:
         self.arg = arg
         self.agent_dir = os.path.join(
             arg.ssh_tmp,
@@ -242,8 +248,8 @@ class StartAgent:
 
     def mk_specifier(self) -> str:
         stime = str(time.time())
-        regx = self.get_specifier.search(stime)
-        spec = regx.group() if regx else stime
+        reObj = self.get_specifier.search(stime)
+        spec = reObj.group() if reObj else stime
         return '.'.join((spec[0:3], spec[3:]))
 
     def mk_agent_dir(self) -> None:
@@ -276,9 +282,9 @@ class StartAgent:
                 err.decode() if err else str()
             )
         for i in out.decode().splitlines():
-            regx = self.get_agent_pid.search(i)
-            if regx:
-                self.pid = regx.group()
+            reObj = self.get_agent_pid.search(i)
+            if reObj:
+                self.pid = reObj.group()
                 return
 
     def find_ssh_id(self) -> str:
@@ -314,15 +320,15 @@ class Identity:
         '^\-{5}BEGIN\s[A-Z ]+\sPRIVATE\sKEY\-{5}\n'
     )
 
-    def __init__(self, pid: str, sock: str, ssh_dir: str) -> None:
+    def __init__(self, pid:str, sock:str, ssh_dir:str) -> None:
         self.pid = pid
         self.sock = sock
         self.ssh_dir = ssh_dir
 
-    def __call__(self) -> List[str]:
+    def __call__(self) -> list[str]:
         return self.get_ids()
 
-    def get_ids(self) -> List[str]:
+    def get_ids(self) -> list[str]:
         priv_fingers = self.get_private_key_fingerprints()
         agent_fingers = self.list_agent_fingerprints()
         ids = list()
@@ -339,7 +345,7 @@ class Identity:
             return agent_fingers
         return ids                    
 
-    def list_agent_fingerprints(self) -> List[str]:
+    def list_agent_fingerprints(self) -> list[str]:
         cmd = (
             '/usr/bin/env',
             f'SSH_AGENT_PID={self.pid}',
@@ -355,7 +361,7 @@ class Identity:
             return out.decode().splitlines()
         return list()
 
-    def get_fingerprint(self, file: str) -> str:
+    def get_fingerprint(self, file:str) -> str:
         file = os.path.join(self.ssh_dir, file)
         cmd = (
             '/usr/bin/ssh-keygen', '-l', '-f', file
@@ -369,7 +375,7 @@ class Identity:
             return out.decode().rstrip()
         return str()
 
-    def is_private_key(self, file: str) -> bool:
+    def is_private_key(self, file:str) -> bool:
         file = os.path.join(self.ssh_dir, file)
         try:
             with open(file) as fd:
@@ -383,6 +389,30 @@ class Identity:
             for i in os.listdir(self.ssh_dir)
             if self.is_private_key(i)
         }
+
+
+class AgentPidType(TypedDict):
+    exported: bool
+    managed: bool
+    pid: str
+    pidfile: str
+    timestamp: str
+    valid: bool
+
+
+class AuthSockType(TypedDict):
+    exported: bool
+    managed: bool
+    socket: str
+    timestamp: str
+    valid: bool
+
+
+class AgentSpecType(TypedDict):
+    IDENTITY: list[str]
+    SSH_AGENT_PID: AgentPidType
+    SSH_AUTH_SOCK: AuthSockType
+    VALID: bool
 
 
 class AgentInfo:
@@ -469,7 +499,7 @@ class AgentInfo:
         )
 
     @property
-    def identities(self) -> List[str]:
+    def identities(self) -> list[str]:
         if self.is_valid:
             return Identity(self.pid, self.socket, self.ssh_dir)()
         return list()
@@ -479,24 +509,32 @@ class AgentInfo:
         return self.has_valid_pid and self.has_valid_sock
 
     @property
-    def info(self) -> dict[str,object]:
+    def ssh_agent_pid(self) -> AgentPidType:
+        return {
+            'exported': self.has_exported_pid,
+            'managed': self.has_managed_pid,
+            'pid': self.pid,
+            'pidfile': self.pidfile,
+            'timestamp': self.pid_timestamp,
+            'valid': self.has_valid_pid
+        }
+
+    @property
+    def ssh_auth_sock(self) -> AuthSockType:
+        return {
+            'exported': self.has_exported_sock,
+            'managed': self.has_managed_sock,
+            'socket': self.socket,
+            'timestamp': self.sock_timestamp,
+            'valid': self.has_valid_sock
+        }
+
+    @property
+    def info(self) -> AgentSpecType:
         return {
             'IDENTITY': self.identities,
-            'SSH_AGENT_PID': {
-                'exported': self.has_exported_pid,
-                'managed': self.has_managed_pid,
-                'pid': self.pid,
-                'pidfile': self.pidfile,
-                'timestamp': self.pid_timestamp,
-                'valid': self.has_valid_pid
-            },
-            'SSH_AUTH_SOCK': {
-                'exported': self.has_exported_sock,
-                'managed': self.has_managed_sock,
-                'socket': self.socket,
-                'timestamp': self.sock_timestamp,
-                'valid': self.has_valid_sock
-            },
+            'SSH_AGENT_PID': self.ssh_agent_pid,
+            'SSH_AUTH_SOCK': self.ssh_auth_sock,
             'VALID': self.is_valid
         }
 
@@ -504,16 +542,16 @@ class AgentInfo:
 class ManagedAgentInfo(AgentInfo):
     get_specifier = re.compile('\d{3}\.\d{4}\.\d{3}$')
 
-    def __init__(self, agent_dir: str, ssh_dir: str) -> None:
+    def __init__(self, agent_dir:str, ssh_dir:str) -> None:
         self.agent_dir = agent_dir
         self.ssh_dir = ssh_dir
 
     @property
     def specifier(self) -> str:
-        regx = self.get_specifier.search(
+        reObj = self.get_specifier.search(
             os.path.basename(self.agent_dir)
         )
-        return regx.group() if regx else '000.0000.000'
+        return reObj.group() if reObj else '000.0000.000'
 
     @property
     def pid(self) -> str:
@@ -563,7 +601,7 @@ class ManagedAgentInfo(AgentInfo):
 class NonManagedAgentInfo(AgentInfo):
     get_specifier = re.compile('\d{7}\.\d')
 
-    def __init__(self, pid: str, sock: str) -> None:
+    def __init__(self, pid:str, sock:str) -> None:
         self._pid = pid
         self._sock = sock
 
@@ -599,27 +637,31 @@ class NonManagedAgentInfo(AgentInfo):
             secs = pid_secs if pid_secs < sock_secs else sock_secs
         else:
             secs = pid_secs or sock_secs
-        regx = self.get_specifier.search(str(secs))
-        s = regx.group() if regx else str(secs)
-        return '.'.join((s[0:3], s[3:7], s[8]+'00'))
+        reObj = self.get_specifier.search(str(secs))
+        spec = reObj.group() if reObj else str(secs)
+        return '.'.join((
+            spec[0:3],
+            spec[3:7],
+            spec[8]+'00'
+        ))
 
 
-class AgentDiscovery:
-    agents: dict[str,Any] = {}
+class DiscoverAgents:
+    agents: dict[str,AgentSpecType] = {}
 
     is_agent_dir = re.compile(
         '^ssh-agent\-[0-9]{3}\.[0-9]{4}.[0-9]{3}$'
     )
 
-    def __init__(self, arg: argparse.Namespace) -> None:
+    def __init__(self, arg:Namespace) -> None:
         self.arg = arg
         self.discover_managed_agents()
         self.discover_nonmanaged_agent()
 
-    def __call__(self) -> dict[str,Any]:
+    def __call__(self) -> dict[str,AgentSpecType]:
         return self.agents
 
-    def rm_invalid_agent(self, agent_dir: str, info: dict[str,Any]) -> bool:
+    def rm_invalid_agent(self, agent_dir:str, info:AgentSpecType) -> bool:
         if any((
             info['SSH_AGENT_PID']['valid'],
             info['SSH_AUTH_SOCK']['socket'],
@@ -646,30 +688,28 @@ class AgentDiscovery:
             if not os.stat(agent_dir).st_uid == EUID:
                 continue
             agent = ManagedAgentInfo(agent_dir, self.arg.ssh_dir)
-            info = agent.info
-            if self.rm_invalid_agent(agent_dir, info):
+            if self.rm_invalid_agent(agent_dir, agent.info):
                 continue
-            self.agents[agent.specifier] = info
+            self.agents[agent.specifier] = agent.info
 
     def discover_nonmanaged_agent(self) -> None:
         pid = os.environ.get('SSH_AGENT_PID', str())
         sock = os.environ.get('SSH_AUTH_SOCK', str())
         if not pid and not sock:
             return
-        managed_pid = False
-        managed_sock = False
+        managed_pid = managed_sock = False
         for spec in self.agents:
-            agent = self.agents[spec]
+            info = self.agents[spec]
             if all((
                 pid,
-                agent['SSH_AGENT_PID']['pid'] == pid,
-                agent['SSH_AGENT_PID']['managed']
+                info['SSH_AGENT_PID']['pid'] == pid,
+                info['SSH_AGENT_PID']['managed']
             )):
                 managed_pid = True
             if all((
                 sock,
-                agent['SSH_AUTH_SOCK']['socket'] == sock,
-                agent['SSH_AUTH_SOCK']['managed']
+                info['SSH_AUTH_SOCK']['socket'] == sock,
+                info['SSH_AUTH_SOCK']['managed']
             )):
                 managed_sock = True
         if managed_pid and managed_sock:
@@ -682,9 +722,9 @@ class AgentDiscovery:
 # ACTION
 
 class Action:
-    def __init__(self, arg: argparse.Namespace) -> None:
+    def __init__(self, arg:Namespace) -> None:
         self.arg = arg
-        self.agents = AgentDiscovery(arg)()
+        self.agents = DiscoverAgents(arg)()
 
     def __call__(self) -> None:
         raise NotImplemented
@@ -694,7 +734,7 @@ class Env(Action):
     def __call__(self) -> None:
         self.get_agent_env()
 
-    def print_env(self, agent: dict[str,Any]) -> None:
+    def print_env(self, agent:AgentSpecType) -> None:
         pid = agent['SSH_AGENT_PID']['pid']
         sock = agent['SSH_AUTH_SOCK']['socket']
         print(f'SSH_AGENT_PID={pid} SSH_AUTH_SOCK={sock}')
@@ -748,21 +788,18 @@ class Env(Action):
 
 class Status(Action):
     pad = ' '*4
+    tty = sys.stdout.isatty()
 
     def __call__(self) -> None:
-        if sys.stdout.isatty():
-            self.format_info = self._format_info
-        else:
-            self.format_info = lambda info: info
         self.show_status()
 
-    def _format_info(self, info: Any) -> Any:
+    def format_info(self, info:bool|None|str) -> str:
         if info is False:
-            return '\033[1;31mfalse\033[0m'
+            return '\033[1;31mfalse\033[0m' if self.tty else 'false'
         elif info is True:
-            return '\033[1;32mtrue\033[0m'
+            return '\033[1;32mtrue\033[0m' if self.tty else 'true'
         elif not info:
-            return '\033[1;30mnone\033[0m'
+            return '\033[1;30mnone\033[0m' if self.tty else 'none'
         else:
             return info
 
@@ -771,28 +808,42 @@ class Status(Action):
         print(f'{self.pad}euid:', EUID)
         print(f'{self.pad}name:', getpwuid(EUID).pw_name)
 
-    def print_agent(self, spec: str, agent: dict[str,Any]) -> None:
+    def print_identities(self, info:list[str]) -> None:
+        print(f'{self.pad}IDENTITY:')
+        if info:
+            for i in info:
+                print(f'{self.pad*2}{self.format_info(i)}')
+        else:
+            print(f'{self.pad*2}{self.format_info(None)}')
+
+    def print_agent_pid(self, info:AgentPidType) -> None:
+        print(
+            f'{self.pad}SSH_AGENT_PID:\n'
+            f'{self.pad*2}exported: {self.format_info(info["exported"])}\n'
+            f'{self.pad*2}managed: {self.format_info(info["managed"])}\n'
+            f'{self.pad*2}pid: {self.format_info(info["pid"])}\n'
+            f'{self.pad*2}pidfile: {self.format_info(info["pidfile"])}\n'
+            f'{self.pad*2}timestamp: {self.format_info(info["timestamp"])}\n'
+            f'{self.pad*2}valid: {self.format_info(info["valid"])}'
+        )
+
+    def print_auth_sock(self, info:AuthSockType) -> None:
+        print(
+            f'{self.pad}SSH_AUTH_SOCK:\n'
+            f'{self.pad*2}exported: {self.format_info(info["exported"])}\n'
+            f'{self.pad*2}managed: {self.format_info(info["managed"])}\n'
+            f'{self.pad*2}socket: {self.format_info(info["socket"])}\n'
+            f'{self.pad*2}timestamp: {self.format_info(info["timestamp"])}\n'
+            f'{self.pad*2}valid: {self.format_info(info["valid"])}'
+        )
+
+    def print_agent(self, spec:str, agent:AgentSpecType) -> None:
+        # PROVIDE LITERALS FOR TypedDict OBJECTS
         print('\nAGENT:', spec)
-        for info in agent:
-            if isinstance(agent[info], dict):
-                print(f'{self.pad}{info}:')
-                for i in agent[info]:
-                    print(
-                        f'{self.pad*2}{i}:',
-                        self.format_info(agent[info][i])
-                    )
-            elif isinstance(agent[info], list):
-                print(f'{self.pad}{info}:')
-                if agent[info]:
-                    for i in agent[info]:
-                        print(f'{self.pad*2}{self.format_info(i)}')
-                else:
-                    print(f'{self.pad*2}{self.format_info(None)}')
-            else:
-                print(
-                    f'{self.pad}{info}:',
-                    self.format_info(agent[info])
-                )
+        self.print_identities(agent['IDENTITY'])
+        self.print_agent_pid(agent['SSH_AGENT_PID'])
+        self.print_auth_sock(agent['SSH_AUTH_SOCK'])
+        print(f'{self.pad}VALID: {self.format_info(agent["VALID"])}')
 
     def show_status(self) -> None:
         if not self.agents:
@@ -841,8 +892,8 @@ class Start(Action):
                 len(ids) == 1 and self.arg.identity in ids
             )):
                 raise AgentAlreadyExists(
-                    self.agents[spec]['SSH_AGENT_PID']['pid'],
-                    self.agents[spec]['SSH_AUTH_SOCK']['socket']
+                    str(self.agents[spec]['SSH_AGENT_PID']['pid']),
+                    str(self.agents[spec]['SSH_AUTH_SOCK']['socket'])
                 )
         StartAgent(self.arg)()
 
@@ -851,7 +902,7 @@ class Stop(Action):
     def __call__(self) -> None:
         self.stop_agent()
 
-    def print_env(self, agent: dict[str,Any]) -> None:
+    def print_env(self, agent:AgentSpecType) -> None:
         pid = agent['SSH_AGENT_PID']['pid']
         sock = agent['SSH_AUTH_SOCK']['socket']
 
@@ -864,7 +915,7 @@ class Stop(Action):
         if env:
             print(f'unset{env}')
 
-    def kill(self, spec: str, agent: dict[str,Any]) -> None:
+    def kill(self, spec:str, agent:AgentSpecType) -> None:
         pid = agent['SSH_AGENT_PID']['pid']
         sock = agent['SSH_AUTH_SOCK']['socket']
 
