@@ -1,0 +1,1072 @@
+#!/usr/bin/env python3
+'''\
+ssh-agent-manager
+
+ACTIONS:
+ start)
+   START «ssh-agent» INSTANCE.
+   AN IDENTITY MAY BE GIVEN FOR «ssh-add».
+
+ stop)
+   STOP «ssh-agent» INSTANCE.
+   IF GIVEN, --agent OR --id PARAMETER WILL BE USED.
+
+ status)
+   STATUS OF «ssh-agent» INSTANCES MANAGED BY «{NAME}».
+   NOTE: OTHER, NON-MANAGED INSTANCES MAY ALSO EXIST.
+   IF GIVEN, --agent OR --id PARAMETER WILL BE USED.
+
+ env)
+   PRINT «ssh-agent» VARIABLES SUITABLE FOR `eval`.
+   RETURNS SOCKET AND PID FOR MANAGED INSTANCE, IF ANY.
+
+ help)
+   THIS IS IT.
+
+ARGUMENT:
+ -a, --agent)
+   AGENT SPECIFIER.
+
+ -i, --id)
+   FILENAME FOR SSH PRIVATE KEY IDENTITY.
+
+ENVIRONMENT VARIABLES RECOGNIZED BY «ssh-agent-manager»:
+ SSH_DIR)
+   OPTIONAL.
+   DIRECTORY WHERE SSH PRIVATE KEY IDENTITIES ARE FOUND.
+    ~/.ssh IS DEFAULT.
+
+ SSH_TMP)
+   OPTIONAL.
+   DIRECTORY UNDER WHICH «ssh-agent» SOCKET AND PID FILE ARE WRITTEN.
+   DEFAULT IS $XDG_RUNTIME_DIR OR /tmp
+
+ENVIRONMENT VARIABLES USED BY «ssh-agent»:
+ SSH_AGENT_PID)
+ SSH_AUTH_SOCK)
+   THESE ARE USED TO DISCOVER AND MANAGE AGENT.
+
+EXAMPLE USAGE:
+ START AGENT USING IDENTITY
+   $ ssh-agent-manager start --id some_id_rsa
+
+ STOP AGENT USING AGENT SPECIFIER
+   $ ssh-agent-manager stop --agent 111.2222.333
+
+ POPULATE ENVIRONMENT WITH «ssh-agent» VARIABLES:
+   $ eval $(ssh-agent-manager env)
+   … OR …
+   $ export $(ssh-agent-manager env --id some_id_rsa)
+'''
+
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+# IMPORT
+
+import os
+import re
+import sys
+import time
+from argparse import ArgumentParser, Namespace
+from pwd import getpwuid
+from signal import SIGHUP
+from stat import S_ISSOCK as is_socket
+from subprocess import Popen
+
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+# GLOBAL
+
+# MAXIMUM LIFETIME OF NEW AGENT IDENTITY
+# 50 MINS, IN SECONDS
+TIMEOUT=3000
+
+EUID = os.geteuid()
+
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+# EXCEPTION
+
+class Help(SystemExit):
+    def __init__(self) -> None:
+        print(__doc__)
+        super().__init__()
+
+
+class AgentAlreadyExists(SystemExit):
+    msg = 'SSH_AGENT_PID=%s SSH_AUTH_SOCK=%s'
+    def __init__(self, pid:str, sock:str) -> None:
+        print(self.msg % (pid, sock), end='')
+        super().__init__('\0')
+
+
+class NoAgentFound(SystemExit):
+    def __init__(self, detail: str=str()) -> None:
+        msg = 'NO AGENT WAS FOUND'
+        if detail:
+            msg = ' '.join((msg, detail))
+        else:
+            msg += '.'
+        super().__init__(msg)
+
+
+class StartAgentError(RuntimeError):
+    def __init__(self, err: str=str()) -> None:
+        msg = 'PROBLEM STARTING AGENT.'
+        if err:
+            msg += f'\n{err}'
+        super().__init__(msg)
+
+
+class AddIdentityError(RuntimeError):
+    def __init__(self, err: str=str()) -> None:
+        msg = 'PROBLEM ADDING SSH IDENTITY.'
+        if err:
+            msg = '\n'.join((msg, err))
+        super().__init__(msg)
+
+
+class IdentityNotFoundError(Exception):
+    msg = 'COULD NOT FIND SSH IDENTITY "%s".'
+    def __init__(self, ident: str) -> None:
+        super().__init__(self.msg % ident)
+
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+# ARGUMENT
+
+class Arg:
+    namespace = Namespace(
+        action = str(),
+        identity = str(),
+        agent = str(),
+        ssh_dir = str(),
+        ssh_tmp = str()
+    )
+
+    def __call__(self) -> Namespace:
+        return self.namespace
+
+    def __init__(self) -> None:
+        self.get_cmd_args()
+        self.get_env_args()
+
+    def get_cmd_args(self) -> None:
+        parser = ArgumentParser(
+            add_help = False,
+            usage = '==SUPPRESS=='
+        )
+        parser.add_argument(
+            '-h', '--help',
+            action = 'store_true',
+            dest = 'help'
+        )
+        parser.add_argument(
+            '-i', '--id',
+            dest = 'identity'
+        )
+        parser.add_argument(
+            '-a', '--agent',
+            dest = 'agent'
+        )
+        parser.add_argument(
+            'action',
+            choices = (
+                'env',
+                'help',
+                'start',
+                'stop',
+                'status'
+            ),
+            nargs = '?'
+        )
+        args = parser.parse_args(namespace=self.namespace)
+        if any((
+            args.help,
+            args.action == 'help',
+            args.action is None
+        )):
+            raise Help
+
+    def get_ssh_dir(self) -> str:
+        ssh_dir = os.environ.get('SSH_DIR')
+        if ssh_dir:
+            if not os.path.isdir(ssh_dir):
+                raise NotADirectoryError(ssh_dir)
+            if not os.access(ssh_dir, os.X_OK|os.W_OK|os.R_OK):
+                raise PermissionError(ssh_dir)
+            return ssh_dir
+        return os.path.join(getpwuid(EUID).pw_dir, '.ssh')
+
+    def get_tmp_dir(self) -> str:
+        ssh_tmp = os.environ.get('SSH_TMP')
+        if ssh_tmp:
+            if not os.path.isdir(ssh_tmp):
+                raise NotADirectoryError(ssh_tmp)
+            if not os.access(ssh_tmp, os.X_OK|os.W_OK|os.R_OK):
+                raise PermissionError(ssh_tmp)
+            return ssh_tmp
+        xdg_dir = os.environ.get('XDG_RUNTIME_DIR')
+        if xdg_dir and os.path.isdir(xdg_dir):
+            return os.path.join(xdg_dir, 'tmp')
+        return '/tmp'
+
+    def get_env_args(self) -> None:
+        self.namespace.ssh_dir = self.get_ssh_dir()
+        self.namespace.ssh_tmp = self.get_tmp_dir()
+
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+# AGENT
+
+class Identity:
+    has_key_format = re.compile(
+        '^\-{5}BEGIN\s[A-Z ]+\sPRIVATE\sKEY\-{5}\n'
+    )
+
+    def __init__(self, pid:str, sock:str, ssh_dir:str) -> None:
+        self.pid = pid
+        self.sock = sock
+        self.ssh_dir = ssh_dir
+
+    def __call__(self) -> list[str]:
+        return self.get_ids()
+
+    def get_ids(self) -> list[str]:
+        priv_fingers = self.get_private_key_fingerprints()
+        agent_fingers = self.list_agent_fingerprints()
+        ids = list()
+        for i in agent_fingers:
+            try:
+                ids.append(priv_fingers[i])
+                break
+            except IndexError:
+                continue
+        if agent_fingers and not ids:
+            msg = 'WARNING. FAILED TO MATCH PRIVATE '\
+                'KEY IDENTITIES. CHECK YOUR SSH KEYS.'
+            print(msg, file=sys.stderr)
+            return agent_fingers
+        return ids                    
+
+    def list_agent_fingerprints(self) -> list[str]:
+        cmd = (
+            '/usr/bin/env',
+            f'SSH_AGENT_PID={self.pid}',
+            f'SSH_AUTH_SOCK={self.sock}',
+            '/usr/bin/ssh-add', '-l'
+        )
+        popen = Popen(cmd, stdout=-1, stderr=-3)
+        out, _ = popen.communicate()
+        if all((
+            popen.returncode == 0,
+            out is not None
+        )):
+            return out.decode().splitlines()
+        return list()
+
+    def get_fingerprint(self, file:str) -> str:
+        file = os.path.join(self.ssh_dir, file)
+        cmd = (
+            '/usr/bin/ssh-keygen', '-l', '-f', file
+        )
+        popen = Popen(cmd, stdout=-1, stderr=-3)
+        out, _ = popen.communicate()
+        if all((
+            popen.returncode == 0,
+            out is not None
+        )):
+            return out.decode().rstrip()
+        return str()
+
+    def is_private_key(self, file:str) -> bool:
+        file = os.path.join(self.ssh_dir, file)
+        try:
+            with open(file) as fd:
+                return bool(self.has_key_format.match(fd.read()))
+        except:
+            return False
+
+    def get_private_key_fingerprints(self) -> dict[str,str]:
+        return {
+            self.get_fingerprint(i): i
+            for i in os.listdir(self.ssh_dir)
+            if self.is_private_key(i)
+        }
+
+
+class AgentPidParam:
+    def __init__(
+        self,
+        pid = str(),
+        exported = bool(),
+        managed = bool(),
+        pidfile = str(),
+        timestamp = str(),
+        valid = bool()
+    ) -> None:
+        self.pid = pid
+        self.exported = exported
+        self.managed = managed
+        self.pidfile = pidfile
+        self.timestamp = timestamp
+        self.valid = valid
+
+
+class AuthSockParam:
+    def __init__(
+        self,
+        socket = str(),
+        exported = bool(),
+        managed = bool(),
+        timestamp = str(),
+        valid = bool()
+    ) -> None:
+        self.socket = socket
+        self.exported = exported
+        self.managed = managed
+        self.timestamp = timestamp
+        self.valid = valid
+
+
+class AgentParam:
+    def __init__(
+        self,
+        specifier = '000.0000.000',
+        identities: list[str] = list(),
+        ssh_agent_pid = AgentPidParam(),
+        ssh_auth_sock = AuthSockParam(),
+        expiration = float(),
+        valid = bool()
+    ) -> None:
+        self.specifier = specifier
+        self.identities = identities
+        self.ssh_agent_pid = ssh_agent_pid
+        self.ssh_auth_sock = ssh_auth_sock
+        self.expiration = expiration
+        self.valid = valid
+
+
+class Agent:
+    ssh_dir = str()
+
+    @property
+    def specifier(self) -> str:
+        raise NotImplemented
+
+    @property
+    def pid(self) -> str:
+        raise NotImplemented
+
+    @property
+    def has_exported_pid(self) -> bool:
+        raise NotImplemented
+
+    @property
+    def has_managed_pid(self) -> bool:
+        return bool()
+
+    @property
+    def pidfile(self) -> str:
+        return str()
+
+    @property
+    def socket(self) -> str:
+        raise NotImplemented
+
+    @property
+    def has_exported_sock(self) -> bool:
+        raise NotImplemented
+
+    @property
+    def has_managed_sock(self) -> bool:
+        return bool()
+
+    @property
+    def has_valid_pid(self) -> bool:
+        try:
+            pid = int(self.pid) 
+        except:
+            return False
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        else:
+            return True
+
+    @property
+    def pid_stat_time(self) -> float:
+        if not self.pid:
+            return float()
+        try:
+            with open(f'/proc/{self.pid}/stat') as fd:
+                start = float(fd.read().split()[21])
+        except:
+            return float()
+        ticks = os.sysconf(os.sysconf_names['SC_CLK_TCK'])
+        return get_btime() + (start / ticks)
+
+    @property
+    def pid_timestamp(self) -> str:
+        secs = self.pid_stat_time
+        if not secs:
+           return str()
+        return time.strftime(
+            '%Y-%m-%d %H:%M:%S',
+            time.localtime(secs)
+        )
+
+    @property
+    def has_valid_sock(self) -> bool:
+        try:
+            st = os.lstat(self.socket)
+        except:
+            return False
+        return st.st_uid == EUID and is_socket(st.st_mode)
+
+    @property
+    def sock_timestamp(self) -> str:
+        if not self.has_valid_sock:
+           return str()
+        secs = os.lstat(self.socket).st_mtime
+        return time.strftime(
+            '%Y-%m-%d %H:%M:%S',
+            time.localtime(secs)
+        )
+
+    @property
+    def identities(self) -> list[str]:
+        if self.is_valid:
+            return Identity(self.pid, self.socket, self.ssh_dir)()
+        return list()
+
+    @property
+    def ssh_agent_pid(self) -> AgentPidParam:
+        return AgentPidParam(
+            pid = self.pid,
+            exported = self.has_exported_pid,
+            managed = self.has_managed_pid,
+            pidfile = self.pidfile,
+            timestamp = self.pid_timestamp,
+            valid = self.has_valid_pid
+        )
+
+    @property
+    def ssh_auth_sock(self) -> AuthSockParam:
+        return AuthSockParam(
+            socket = self.socket,
+            exported =  self.has_exported_sock,
+            managed = self.has_managed_sock,
+            timestamp = self.sock_timestamp,
+            valid = self.has_valid_sock
+        )
+
+    @property
+    def expiration(self) -> float:
+        raise NotImplemented
+
+    @property
+    def is_valid(self) -> bool:
+        return all((
+            self.has_valid_pid,
+            self.has_valid_sock,
+            time.time() < self.expiration
+        ))
+
+    @property
+    def parameters(self) -> AgentParam:
+        return AgentParam(
+            specifier = self.specifier,
+            identities = self.identities,
+            ssh_agent_pid = self.ssh_agent_pid,
+            ssh_auth_sock = self.ssh_auth_sock,
+            expiration = self.expiration,
+            valid = self.is_valid
+        )
+
+
+class ManagedAgent(Agent):
+    get_specifier = re.compile('\d{3}\.\d{4}\.\d{3}$')
+
+    def __init__(self, agent_dir:str, ssh_dir:str) -> None:
+        self.agent_dir = agent_dir
+        self.ssh_dir = ssh_dir
+
+    @property
+    def specifier(self) -> str:
+        reObj = self.get_specifier.search(
+            os.path.basename(self.agent_dir)
+        )
+        return reObj.group() if reObj else '000.0000.000'
+
+    @property
+    def pid(self) -> str:
+        try:
+            with open(self.pidfile) as fd:
+                return fd.read()
+        except:
+            return str()
+
+    @property
+    def pidfile(self) -> str:
+        pidfile = os.path.join(self.agent_dir, 'agent.pid')
+        return pidfile if os.path.exists(pidfile) else str()
+
+    @property
+    def has_managed_pid(self) -> bool:
+        return True if self.pidfile else False
+
+    @property
+    def has_exported_pid(self) -> bool:
+        if not self.pid:
+            return False
+        try:
+            env = os.environ['SSH_AGENT_PID']
+        except KeyError:
+            return False
+        return env == self.pid
+
+    @property
+    def socket(self) -> str:
+        sock = os.path.join(self.agent_dir, 'agent.sock')
+        return sock if os.path.exists(sock) else str()
+
+    @property
+    def has_managed_sock(self) -> bool:
+        return True if self.socket else False
+
+    @property
+    def has_exported_sock(self) -> bool:
+        try:
+            env = os.environ['SSH_AUTH_SOCK']
+        except KeyError:
+            return False
+        return env == self.socket
+
+    @property
+    def expiration(self) -> float:
+        file = os.path.join(self.agent_dir, 'agent.expiration')
+        try:
+            with open(file) as fd:
+                return float(fd.read())
+        except:
+            return float()
+
+
+class NonManagedAgent(Agent):
+    get_specifier = re.compile('\d{7}\.\d')
+
+    def __init__(self, pid:str, sock:str) -> None:
+        self._pid = pid
+        self._sock = sock
+
+    @property
+    def pid(self) -> str:
+        return self._pid
+
+    @property
+    def has_exported_pid(self) -> bool:
+        return True if self.pid else False
+
+    @property
+    def socket(self) -> str:
+        return self._sock
+
+    @property
+    def has_exported_sock(self) -> bool:
+        return True if self.socket else False
+
+    @property
+    def specifier(self) -> str:
+        if self.has_valid_pid:
+            pid_secs = self.pid_stat_time
+        else:
+            pid_secs = 0
+        if self.has_valid_sock:
+            sock_secs = os.lstat(self.socket).st_mtime
+        else:
+            sock_secs = 0
+        if not pid_secs and not sock_secs:
+            return '000.0000.000'
+        if pid_secs and sock_secs:
+            secs = pid_secs if pid_secs < sock_secs else sock_secs
+        else:
+            secs = pid_secs or sock_secs
+        reObj = self.get_specifier.search(str(secs))
+        spec = reObj.group() if reObj else str(secs)
+        return '.'.join((
+            spec[0:3],
+            spec[3:7],
+            spec[8]+'00'
+        ))
+
+    @property
+    def expiration(self) -> float:
+        return float()
+
+
+class DiscoverAgents:
+    agents: list[AgentParam] = list()
+
+    is_agent_dir = re.compile(
+        '^ssh-agent\-[0-9]{3}\.[0-9]{4}.[0-9]{3}$'
+    )
+
+    def __init__(self, arg:Namespace) -> None:
+        self.arg = arg
+        self.discover_managed_agents()
+        self.discover_nonmanaged_agent()
+
+    def __call__(self) -> list[AgentParam]:
+        return self.agents
+
+    def rm_invalid_agent(self, agent_dir:str, agent:AgentParam) -> bool:
+        if any((
+            agent.ssh_agent_pid.valid,
+            agent.ssh_auth_sock.socket,
+            agent.ssh_auth_sock.valid
+        )):
+            return False # NOT REMOVING
+        for i in os.listdir(agent_dir):
+            path = os.path.join(agent_dir, i)
+            os.remove(path)
+        os.rmdir(agent_dir)
+        return True
+
+    def discover_managed_agents(self) -> None:
+        if not os.path.isdir(self.arg.ssh_tmp):
+            # `ssh_tmp` MAY NOT YET BE CREATED
+            return
+        for i in os.listdir(self.arg.ssh_tmp):
+            if not self.is_agent_dir.match(i):
+                continue
+            agent_dir = os.path.join(self.arg.ssh_tmp, i)
+            if not os.path.isdir(agent_dir):
+                continue
+            # CHECK PATH OWNERSHIP, `ssh_tmp` MAY BE /tmp
+            if not os.stat(agent_dir).st_uid == EUID:
+                continue
+            agent = ManagedAgent(agent_dir, self.arg.ssh_dir).parameters
+            if self.rm_invalid_agent(agent_dir, agent):
+                continue
+            self.agents.append(agent)
+
+    def discover_nonmanaged_agent(self) -> None:
+        pid = os.environ.get('SSH_AGENT_PID', str())
+        sock = os.environ.get('SSH_AUTH_SOCK', str())
+        if not pid and not sock:
+            return
+        managed_pid = managed_sock = False
+        for agent in self.agents:
+            if all((
+                pid,
+                agent.ssh_agent_pid.pid == pid,
+                agent.ssh_agent_pid.managed
+            )):
+                managed_pid = True
+            if all((
+                sock,
+                agent.ssh_auth_sock.socket == sock,
+                agent.ssh_auth_sock.managed
+            )):
+                managed_sock = True
+        if managed_pid and managed_sock:
+            return
+        self.agents.append(
+            NonManagedAgent(pid, sock).parameters
+        )
+
+
+class StartAgent:
+    get_agent_spec = re.compile('\d{7}\.\d{3}')
+    get_agent_pid = re.compile('(?<=^SSH_AGENT_PID=)\d+')
+
+    def __init__(self, arg:Namespace) -> None:
+        self.arg = arg
+        self.agent_dir = os.path.join(
+            arg.ssh_tmp,
+            f'ssh-agent-{self.mk_agent_spec()}'
+        )
+        self.sock = os.path.join(
+            self.agent_dir,
+            'agent.sock'
+        )
+        self.pid = str()
+
+    def __call__(self) -> None:
+        self.mk_agent_dir()
+        self.start_agent()
+        self.write_pidfile()
+        self.write_expire_time()
+        if self.arg.identity:
+            self.add_identity()
+        print(f'SSH_AGENT_PID={self.pid} SSH_AUTH_SOCK={self.sock}')
+
+    def mk_agent_spec(self) -> str:
+        stime = str(time.time())
+        reObj = self.get_agent_spec.search(stime)
+        spec = reObj.group() if reObj else stime
+        return '.'.join((spec[0:3], spec[3:]))
+
+    def mk_agent_dir(self) -> None:
+        if all((
+            self.arg.ssh_tmp != '/tmp',
+            not os.path.isdir(self.arg.ssh_tmp)
+        )):
+            os.mkdir(self.arg.ssh_tmp, mode=0o700)
+        os.mkdir(self.agent_dir, mode=0o700)
+
+    def write_expire_time(self) -> None:
+        file = os.path.join(self.agent_dir, 'agent.expiration')
+        xtime = time.time() + TIMEOUT
+        with open(file, 'w') as fd:
+            fd.write(str(xtime))
+        os.chmod(file, 0o600)
+
+    def write_pidfile(self) -> None:
+        file = os.path.join(self.agent_dir, 'agent.pid')
+        with open(file, 'w') as fd:
+            fd.write(self.pid)
+        os.chmod(file, 0o600)
+
+    def start_agent(self) -> None:
+        cmd = (
+            '/usr/bin/ssh-agent',
+            '-t', str(TIMEOUT),
+            '-a', self.sock
+        )
+        popen = Popen(cmd, stdout=-1, stderr=-1)
+        out, err = popen.communicate()
+        if any((
+            popen.returncode != 0,
+            out is None
+        )):
+            raise StartAgentError(
+                err.decode() if err else str()
+            )
+        for i in out.decode().splitlines():
+            reObj = self.get_agent_pid.search(i)
+            if reObj:
+                self.pid = reObj.group()
+                return
+
+    def find_ssh_id(self) -> str:
+        ident = str()
+        for i in os.listdir(self.arg.ssh_dir):
+            if i == self.arg.identity:
+                ident = os.path.join(self.arg.ssh_dir, i)
+                break
+        return ident
+
+    def add_identity(self) -> None:
+        ident = self.find_ssh_id()
+        if not ident:
+            raise IdentityNotFoundError(ident)
+        cmd = (
+            '/usr/bin/env',
+            f'SSH_AGENT_PID={self.pid}',
+            f'SSH_AUTH_SOCK={self.sock}',
+            '/usr/bin/ssh-add',
+            ident
+        )
+        popen = Popen(cmd, stdout=-3, stderr=-1)
+        _, err = popen.communicate()
+        if popen.returncode != 0:
+            raise AddIdentityError(
+                err.decode() if err else str()
+            )
+
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+# ACTION
+
+class Action:
+    def __init__(self, arg:Namespace) -> None:
+        self.arg = arg
+        self.agents: list[AgentParam] = DiscoverAgents(arg)()
+
+    def __call__(self) -> None:
+        raise NotImplemented
+
+
+class Env(Action):
+    def __call__(self) -> None:
+        self.get_agent_env()
+
+    def print_env(self, agent:AgentParam) -> None:
+        pid = agent.ssh_agent_pid.pid
+        sock = agent.ssh_auth_sock.socket
+        print(f'SSH_AGENT_PID={pid} SSH_AUTH_SOCK={sock}')
+
+    def get_agent_env(self) -> None:
+        ident = self.arg.identity
+        if self.arg.agent:
+            for agent in self.agents:
+                if self.arg.agent == agent.specifier:
+                    if self.arg.agent == '000.0000.000':
+                        print('unset SSH_AGENT_PID SSH_AUTH_SOCK')
+                        return
+                    if agent.valid:
+                        self.print_env(agent)
+                        return
+            raise NoAgentFound(
+                f'HAVING AGENT SPECIFIER "{self.arg.agent}".'
+            )
+        elif ident:
+            agent_has_id = None
+            for agent in self.agents:
+                if all((
+                    agent.valid,
+                    ident in agent.identities
+                )):
+                    if agent_has_id:
+                        raise NoAgentFound(
+                            f'EXCLUSIVELY HAVING IDENTITY "{ident}".'
+                        )
+                    agent_has_id = agent
+            if not agent_has_id:
+                raise NoAgentFound(
+                    f'HAVING IDENTITY "{ident}".'
+                )
+            self.print_env(agent_has_id)
+        elif len(self.agents) == 1:
+            agent = self.agents[0]
+            if agent.valid:
+                self.print_env(agent)
+            else:
+                print('unset SSH_AGENT_PID SSH_AUTH_SOCK')
+        elif all((
+            len(self.agents) == 0,
+            os.environ.get('SSH_AGENT_PID'),
+            os.environ.get('SSH_AUTH_SOCK')
+        )):
+            print('unset SSH_AGENT_PID SSH_AUTH_SOCK')
+        else:
+            raise NoAgentFound
+
+
+class Status(Action):
+    pad = ' '*4
+    tty = sys.stdout.isatty()
+
+    def __call__(self) -> None:
+        self.show_status()
+
+    def format_param(self, param:bool|None|str) -> str:
+        if param is False:
+            return '\033[1;31mfalse\033[0m' if self.tty else 'false'
+        elif param is True:
+            return '\033[1;32mtrue\033[0m' if self.tty else 'true'
+        elif not param:
+            return '\033[1;30mnone\033[0m' if self.tty else 'none'
+        else:
+            return param
+
+    def print_user(self) -> None:
+        print('USER:')
+        print(f'{self.pad}euid:', EUID)
+        print(f'{self.pad}name:', getpwuid(EUID).pw_name)
+
+    def print_identities(self, ids:list[str]) -> None:
+        print(f'{self.pad}IDENTITY:')
+        if ids:
+            for i in ids:
+                print(f'{self.pad*2}{self.format_param(i)}')
+        else:
+            print(f'{self.pad*2}{self.format_param(None)}')
+
+    def print_agent_pid(self, pid:AgentPidParam) -> None:
+        print(
+            f'{self.pad}SSH_AGENT_PID:\n'
+            f'{self.pad*2}exported: {self.format_param(pid.exported)}\n'
+            f'{self.pad*2}managed: {self.format_param(pid.managed)}\n'
+            f'{self.pad*2}pid: {self.format_param(pid.pid)}\n'
+            f'{self.pad*2}pidfile: {self.format_param(pid.pidfile)}\n'
+            f'{self.pad*2}timestamp: {self.format_param(pid.timestamp)}\n'
+            f'{self.pad*2}valid: {self.format_param(pid.valid)}'
+        )
+
+    def print_auth_sock(self, sock:AuthSockParam) -> None:
+        print(
+            f'{self.pad}SSH_AUTH_SOCK:\n'
+            f'{self.pad*2}exported: {self.format_param(sock.exported)}\n'
+            f'{self.pad*2}managed: {self.format_param(sock.managed)}\n'
+            f'{self.pad*2}socket: {self.format_param(sock.socket)}\n'
+            f'{self.pad*2}timestamp: {self.format_param(sock.timestamp)}\n'
+            f'{self.pad*2}valid: {self.format_param(sock.valid)}'
+        )
+
+    def print_expiration(self, agent:AgentParam) -> None:
+        if agent.expiration:
+            exp = time.strftime(
+                '%Y-%m-%d %H:%M:%S',
+                time.localtime(agent.expiration)
+            )
+            if time.time() < agent.expiration:
+                if self.tty:
+                    exp = f'\033[1;32m{exp}\033[0m'
+            else:
+                if self.tty:
+                    exp = f'\033[1;31m{exp}\033[0m'
+        else:
+            exp = '\033[1;30mnone\033[0m' if self.tty else 'none'
+        print(f'{self.pad}EXPIRATION: {exp}')
+
+    def print_agent(self, agent:AgentParam) -> None:
+        print('\nAGENT:', agent.specifier)
+        self.print_identities(agent.identities)
+        self.print_agent_pid(agent.ssh_agent_pid)
+        self.print_auth_sock(agent.ssh_auth_sock)
+        self.print_expiration(agent)
+        print(f'{self.pad}VALID: {self.format_param(agent.valid)}')
+
+    def show_status(self) -> None:
+        if not self.agents:
+            raise NoAgentFound
+        if self.arg.agent:
+            for agent in self.agents:
+                if self.arg.agent == agent.specifier:
+                    self.print_user()
+                    self.print_agent(agent)
+                    return
+            raise NoAgentFound(
+                f'HAVING AGENT SPECIFIER "{self.arg.agent}".'
+            )
+        elif self.arg.identity:
+            has_id = list()
+            for agent in self.agents:
+                if self.arg.identity in agent.identities:
+                    has_id.append(agent)
+            if not has_id:
+                raise NoAgentFound(
+                    f'HAVING IDENTITY "{self.arg.identity}".'
+                )
+            self.print_user()
+            for agent in has_id:
+                self.print_agent(agent)
+        else:
+            self.print_user()
+            for agent in self.agents:
+                self.print_agent(agent)
+
+
+class Start(Action):
+    def __call__(self) -> None:
+        self.start_agent()
+
+    def start_agent(self) -> None:
+        for agent in self.agents:
+            ids = agent.identities
+            if all((
+                agent.ssh_agent_pid.managed,
+                agent.ssh_auth_sock.managed,
+                agent.valid
+            )) and any((
+                not ids and not self.arg.identity,
+                len(ids) == 1 and self.arg.identity in ids
+            )):
+                raise AgentAlreadyExists(
+                    agent.ssh_agent_pid.pid,
+                    agent.ssh_auth_sock.socket
+                )
+        StartAgent(self.arg)()
+
+
+class Stop(Action):
+    def __call__(self) -> None:
+        self.stop_agent()
+
+    def print_env(self, agent:AgentParam) -> None:
+        pid = agent.ssh_agent_pid.pid
+        sock = agent.ssh_auth_sock.socket
+
+        # WRITE TO STDOUT FOR `eval`
+        env = str()
+        if os.environ.get('SSH_AGENT_PID') == pid:
+            env += ' SSH_AGENT_PID'
+        if os.environ.get('SSH_AUTH_SOCK') == sock:
+            env += ' SSH_AUTH_SOCK'
+        if env:
+            print(f'unset{env}')
+
+    def kill(self, agent:AgentParam) -> None:
+        pid = agent.ssh_agent_pid.pid
+        sock = agent.ssh_auth_sock.socket
+
+        try:
+            os.kill(int(pid), SIGHUP)
+        except ProcessLookupError:
+            pass
+
+        agent_dir = os.path.join(
+            self.arg.ssh_tmp,
+            f'ssh-agent-{agent.specifier}'
+        )
+        # NOTE: SOCKET AUTO-REMOVED UPON «ssh-agent» EXIT
+        if os.path.isdir(agent_dir):
+            file = os.path.join(agent_dir, 'agent.pid')
+            os.remove(file)
+            if not os.listdir(agent_dir):
+                os.rmdir(agent_dir)
+
+    def stop_agent(self) -> None:
+        if self.arg.agent:
+            for agent in self.agents:
+                if self.arg.agent == agent.specifier:
+                    self.kill(agent)
+                    self.print_env(agent)
+                    return
+            raise NoAgentFound(
+                f'HAVING AGENT SPECIFIER "{self.arg.agent}".'
+            )
+        elif self.arg.identity:
+            has_id = list()
+            for agent in self.agents:
+                if self.arg.identity in agent.identities:
+                    has_id.append(agent)
+            if not has_id:
+                raise NoAgentFound(
+                    f'HAVING IDENTITY "{self.arg.identity}".'
+                )
+            if len(has_id) > 1:
+                raise NoAgentFound(
+                    f'EXCLUSIVELY HAVING IDENTITY "{self.arg.identity}".'
+                )
+            agent = has_id[0]
+            self.kill(agent)
+            self.print_env(agent)
+        elif len(self.agents) == 1:
+            agent = self.agents[0]
+            self.kill(agent)
+            self.print_env(agent)
+        else:
+            raise NoAgentFound 
+
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+# UTIL
+
+def get_btime() -> float:
+    with open('/proc/stat') as fd:
+        for line in fd.readlines():
+            if line.startswith('btime '):
+                return float(line.split()[1])
+    return float()
+
+
+def main() -> None:
+    arg = Arg()()
+    {
+        'env': Env,
+        'start': Start,
+        'stop': Stop,
+        'status': Status,
+    }[arg.action](arg)()
+
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+# MAIN
+
+main()
+
